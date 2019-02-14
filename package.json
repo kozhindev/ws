@@ -1,0 +1,9 @@
+{
+  "name": "kozhindev-ws",
+  "version": "1.0.1",
+  "dependencies": {
+    "redis": "^2.8.0",
+    "websocket": "^1.0.28",
+    "winston": "^3.2.1"
+  }
+}
