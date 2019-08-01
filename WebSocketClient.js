@@ -34,7 +34,25 @@ WebSocketClient.prototype = {
             this._connection.close();
         }
     },
+/* TODO
+    subscribe: function(streams) {
+        streams = [].concat(streams);
 
+        this.streams = this.streams.concat(streams);
+        if (this._connection) {
+            this._connection.send('subscribe ' + streams.join(' '));
+        }
+    },
+
+    unsubscribe: function(streams) {
+        streams = [].concat(streams);
+
+        this.streams = this.streams.filter(stream => !streams.includes(stream));
+        if (this._connection) {
+            this._connection.send('unsubscribe ' + streams.join(' '));
+        }
+    },
+*/
     _connect: function () {
         if (!this._authToken) {
             this.authHandler(function (token) {

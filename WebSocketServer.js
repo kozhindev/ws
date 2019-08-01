@@ -19,6 +19,7 @@ module.exports = class WebSocketServer {
         this._onRedisMessage = this._onRedisMessage.bind(this);
 
         this.REDIS_KEY_WS_TOKENS = 'tokens';
+        this.REDIS_EVENT_TOKENS_UPDATE = 'tokens_update';
         this.REASON_CODE_UNAUTHORIZED = 4401;
     }
 
@@ -38,6 +39,7 @@ module.exports = class WebSocketServer {
         // Create redis connection
         this._redisSubClient = redis.createClient();
         this._redisSubClient.on('message', this._onRedisMessage);
+        this._redisSubClient.subscribe(this.redisNamespace + this.REDIS_EVENT_TOKENS_UPDATE);
 
         // Listen requests
         this._wsServer.on('request', this._onRequest);
@@ -61,41 +63,26 @@ module.exports = class WebSocketServer {
      */
     _onRequest(request) {
         const connection = request.accept(null, request.origin);
-        const token = request.resourceURL.query.token;
-        const streams = (request.resourceURL.query.streams || '').split(',').filter(Boolean);
+        connection.queryToken = request.resourceURL.query.token;
+        connection.queryStreams = (request.resourceURL.query.streams || '').split(',').filter(Boolean);
 
         // Log client connected
-        this.logger.debug(`${this.constructor.name} user '${connection.remoteAddresses.join(', ')}' connected, token: ${token}`);
+        this.logger.debug(`${this.constructor.name} user '${connection.remoteAddresses.join(', ')}' connected, token: ${connection.queryToken}`);
 
-        // Fetch access
-        this._redisClient.get(this.redisNamespace + this.REDIS_KEY_WS_TOKENS + ':' + token, (err, reply) => {
-            if (err) {
-                this.logger.error(err);
-                return;
-            }
+        this._refreshAvailableStreams(connection);
 
-            if (!reply) {
-                this.logger.warn(`${this.constructor.name} Not found token '${token}' for connection '${connection.remoteAddresses.join(', ')}`);
-                connection.close(this.REASON_CODE_UNAUTHORIZED, 'Authorization failed, please refresh token.');
-                return;
-            }
-
-            // Subscribe on streams
-            connection.availableStreams = JSON.parse(reply);
-            this._subscribeClient(connection, streams);
-
-            // Unsubscribe redis on disconnect
-            connection.on('close', () => this._unsubscribeClient(connection));
-        });
+        // Unsubscribe redis on disconnect
+        //connection.on('close', () => this._unsubscribeClient(connection));
     }
 
     /**
      * @param {object} connection
+     * @param {string[]|array} requestStreams
      * @private
      */
-    _subscribeClient(connection, requestStreams) {
+    async _subscribeClient(connection, requestStreams) {
         // Unsubscribe previous
-        this._unsubscribeClient(connection);
+        //await this._unsubscribeClient(connection);
 
         // Filter requested streams
         connection.streams = [];
@@ -127,17 +114,27 @@ module.exports = class WebSocketServer {
      * @param {object} connection
      * @private
      */
-    _unsubscribeClient(connection) {
-        this._getStreamNames(connection.streams).forEach(name => {
-            if (this._subscribes[name]) {
-                this._subscribes[name]--;
-                this._redisSubClient.unsubscribe(this.redisNamespace + name);
+    async _unsubscribeClient(connection) {
+        return Promise.all(
+            this._getStreamNames(connection.streams).map(name => {
+                if (this._subscribes[name]) {
+                    this._subscribes[name]--;
+                    if (this._subscribes[name] <= 0) {
+                        delete this._subscribes[name];
+                    }
 
-                if (this._subscribes[name] <= 0) {
-                    delete this._subscribes[name];
+                    return new Promise((resolve, reject) => {
+                        this._redisSubClient.unsubscribe(this.redisNamespace + name, function(err) {
+                            if (err) {
+                                reject(err);
+                            } else {
+                                resolve();
+                            }
+                        });
+                    });
                 }
-            }
-        });
+            })
+        )
     }
 
     _getStreamNames(streams) {
@@ -152,25 +149,64 @@ module.exports = class WebSocketServer {
     _onRedisMessage(stream, message) {
         stream = stream.substr(this.redisNamespace.length);
 
-        const data = JSON.parse(message);
-
-        let subscribersCount = 0;
-        this._wsServer.connections.forEach(connection => {
-            const userStream = connection.streams.find(item => {
-                const name = Array.isArray(item) ? item[0] : item;
-                return name === stream;
+        if (stream === this.REDIS_EVENT_TOKENS_UPDATE) {
+            const tokens = JSON.parse(message);
+            this._wsServer.connections.forEach(connection => {
+                if (tokens.includes(connection.queryToken)) {
+                    this._refreshAvailableStreams(connection);
+                }
             });
-            if (!userStream) {
-                return;
-            }
+        } else {
+            const data = JSON.parse(message);
 
-            if (!Array.isArray(userStream) || userStream[1].indexOf(data.id) !== -1) {
-                connection.send(message);
-                subscribersCount++;
-            }
+            let subscribersCount = 0;
+            this._wsServer.connections.forEach(connection => {
+                const userStream = connection.streams.find(item => {
+                    const name = Array.isArray(item) ? item[0] : item;
+                    return name === stream;
+                });
+                if (!userStream) {
+                    return;
+                }
+
+                if (!Array.isArray(userStream) || [].concat(userStream[1]).indexOf(data.id) !== -1) {
+                    connection.send(message);
+                    subscribersCount++;
+                }
+            });
+
+            this.logger.debug(`${this.constructor.name} Send to stream '${stream}' (${this._wsServer.connections.length} connections, ${subscribersCount} subscribers): ${message}`);
+        }
+    }
+
+    async _refreshAvailableStreams(connection) {
+        const availableStreams = await this._getAvailableStreams(connection.queryToken);
+        if (!availableStreams) {
+            this.logger.warn(`${this.constructor.name} Not found token '${connection.queryToken}' for connection '${connection.remoteAddresses.join(', ')}`);
+            connection.close(this.REASON_CODE_UNAUTHORIZED, 'Authorization failed, please refresh token.');
+        } else {
+            // Subscribe on streams
+            connection.availableStreams = availableStreams;
+            this._subscribeClient(connection, connection.queryStreams);
+        }
+    }
+
+    /**
+     *
+     * @param token
+     * @returns {Promise<unknown>}
+     * @private
+     */
+    _getAvailableStreams(token) {
+        return new Promise((resolve, reject) => {
+            this._redisClient.get(this.redisNamespace + this.REDIS_KEY_WS_TOKENS + ':' + token, (err, reply) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(reply ? JSON.parse(reply) : null);
+                }
+            });
         });
-
-        this.logger.debug(`${this.constructor.name} Send to stream '${stream}' (${this._wsServer.connections.length} connections, ${subscribersCount} subscribers): ${message}`);
     }
 
     /**
