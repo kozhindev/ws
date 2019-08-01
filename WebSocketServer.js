@@ -10,6 +10,7 @@ module.exports = class WebSocketServer {
 
         this.port = params.port || 1400;
         this.redisNamespace = params.redisNamespace || '';
+        this.redisConfig = params.redisConfig || {};
         this.logger = this._createLogger(params.logger);
 
         this._wsServer = null;
@@ -27,6 +28,19 @@ module.exports = class WebSocketServer {
         // Create HTTP server
         const httpServer = http.createServer();
         httpServer.listen(this.port, () => this.logger.info(`${this.constructor.name} is listening on port ${this.port}...`));
+        httpWs.on('request', (req, res) => {
+            if (req.url === '/healthcheck') {
+                const address = httpWs.address();
+                res.writeHead(address ? 200 : 500, {
+                    'Content-Type': 'text/plain'
+                });
+                res.write(JSON.stringify({
+                    ...address,
+                    connections: this._wsServer.connections.length,
+                }));
+                res.end('\n');
+            }
+        });
 
         // Create WS server
         this._wsServer = new webSocketServer({
@@ -34,10 +48,10 @@ module.exports = class WebSocketServer {
         });
 
         // Create redis connection
-        this._redisClient = redis.createClient();
+        this._redisClient = redis.createClient(this.redisConfig);
 
         // Create redis connection
-        this._redisSubClient = redis.createClient();
+        this._redisSubClient = redis.createClient(this.redisConfig);
         this._redisSubClient.on('message', this._onRedisMessage);
         this._redisSubClient.subscribe(this.redisNamespace + this.REDIS_EVENT_TOKENS_UPDATE);
 
