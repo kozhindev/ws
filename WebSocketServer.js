@@ -11,11 +11,11 @@ module.exports = class WebSocketServer {
         this.port = params.port || 1400;
         this.redisNamespace = params.redisNamespace || '';
         this.redisConfig = params.redisConfig || {};
-        this.logger = this._createLogger(params.logger);
 
+        this._createLogger = this._createLogger.bind(this);
+        this.logger = this._createLogger(params.logger);
         this._wsServer = null;
         this._subscribes = {};
-
         this._onRequest = this._onRequest.bind(this);
         this._onRedisMessage = this._onRedisMessage.bind(this);
 
@@ -28,9 +28,9 @@ module.exports = class WebSocketServer {
         // Create HTTP server
         const httpServer = http.createServer();
         httpServer.listen(this.port, () => this.logger.info(`${this.constructor.name} is listening on port ${this.port}...`));
-        httpWs.on('request', (req, res) => {
+        httpServer.on('request', (req, res) => {
             if (req.url === '/healthcheck') {
-                const address = httpWs.address();
+                const address = httpServer.address();
                 res.writeHead(address ? 200 : 500, {
                     'Content-Type': 'text/plain'
                 });
@@ -79,11 +79,31 @@ module.exports = class WebSocketServer {
         const connection = request.accept(null, request.origin);
         connection.queryToken = request.resourceURL.query.token;
         connection.queryStreams = (request.resourceURL.query.streams || '').split(',').filter(Boolean);
-
         // Log client connected
         this.logger.debug(`${this.constructor.name} user '${connection.remoteAddresses.join(', ')}' connected, token: ${connection.queryToken}`);
 
         this._refreshAvailableStreams(connection);
+        /**
+         * TODO При получении сообщения от клиента - вынести отдельно
+         * Тип должен быть utf8 (есть еще бинарный)
+         */
+        connection.on('message', (message) => {
+            if (message.type === 'utf8') {
+                this.logger.debug(`${this.constructor.name} Get from client ${connection.queryToken}: ${message.utf8Data}`);
+                let json = JSON.parse(message.utf8Data);
+                switch (json.action) {
+                    case 'subscribe':
+                        this._subscribeClient(connection, json.data);
+                        break;
+                    case 'unsubscribe':
+                        this._unsubscribeClient(connection, json.data);
+                        break;
+                    default:
+                        this.logger.warn(`Unknown action '${json.action}'`);
+                        return;
+                }
+            }
+        });
 
         // Unsubscribe redis on disconnect
         //connection.on('close', () => this._unsubscribeClient(connection));
@@ -105,10 +125,25 @@ module.exports = class WebSocketServer {
                 // Listen all of available
                 connection.streams = connection.availableStreams;
             } else {
-                connection.streams = connection.availableStreams.filter(availableStream => {
-                    const name = Array.isArray(availableStream) ? availableStream[0] : availableStream;
-                    return requestStreams.indexOf(name) !== -1;
-                });
+                // Перебираем все доступные стримы
+                connection.availableStreams.forEach(availableStream => {
+                    let name = this._getStreamName(availableStream);
+                    // Если стрим с маской, получаем основу, перебираем запрашиваемые стримы.
+                    // Если есть совпадение по имени, то для добавляем стримы для подписки в виде 'streamMaskBase_id'
+                    if (name.endsWith('_*')) {
+                        name = name.substr(0, name.length - 2);
+                        requestStreams.forEach(requestStream => {
+                            if (Array.isArray(requestStream) && requestStream.length === 2 && requestStream[0] === name) {
+                                [].concat(requestStream[1]).forEach(id => {
+                                    connection.streams = connection.streams.concat(requestStream[0] + '_' + id);
+                                    return;
+                                })
+                            }
+                        })
+                    } else if (requestStreams.indexOf(name) !== -1) {
+                        connection.streams = connection.streams.concat(availableStream)
+                    }
+                })
             }
         }
 
@@ -128,31 +163,80 @@ module.exports = class WebSocketServer {
      * @param {object} connection
      * @private
      */
-    async _unsubscribeClient(connection) {
-        return Promise.all(
-            this._getStreamNames(connection.streams).map(name => {
-                if (this._subscribes[name]) {
-                    this._subscribes[name]--;
-                    if (this._subscribes[name] <= 0) {
-                        delete this._subscribes[name];
+    async _unsubscribeClient(connection, streams) {
+        // Если стримы не указаны, отписываеся от всех
+        if (!streams) {
+            streams = this._getStreamNames(connection.streams);
+        }
+
+        // Стримы для отписки
+        let forUnsubscribe = [];
+        // Из доступных стримов находим стримы с маской и перебираем их основы, если есть
+        const maskeds = this._getMaskedStreamNames(connection.availableStreams);
+        if (maskeds.length > 0) {
+            maskeds.forEach(maskedName => {
+                streams.forEach(stream => {
+                    // Если есть совпадение c основанием маски
+                    if (this._getStreamName(stream) === maskedName) {
+                        // Если запрашиваемый стрим в виде ['stream', [ids...]], то все ids добавляем для отписки
+                        if (Array.isArray(stream) && stream.length === 2) {
+                            stream[1].forEach(id => {
+                                forUnsubscribe.push(maskedName + '_' + id);
+                            });
+                        }
+                    } else {
+                        forUnsubscribe.push(this._getStreamName(stream));
                     }
 
-                    return new Promise((resolve, reject) => {
-                        this._redisSubClient.unsubscribe(this.redisNamespace + name, function(err) {
-                            if (err) {
-                                reject(err);
-                            } else {
-                                resolve();
-                            }
+                })
+            })
+        } else {
+            forUnsubscribe = streams;
+        }
+
+        return Promise.all(
+            forUnsubscribe.map(name => {
+                if (this._subscribes[name]) {
+                    this._subscribes[name]--;
+                    // Удаляем из списка стримов клиента
+                    connection.streams = connection.streams.filter(stream => this._getStreamName(stream) != name);
+                    // Если подписчиков не осталось, удаляем из списка и отписываеся от редиса
+                    if (this._subscribes[name] <= 0) {
+                        delete this._subscribes[name];
+                        return new Promise((resolve, reject) => {
+                            this._redisSubClient.unsubscribe(this.redisNamespace + name, (err) => {
+                                if (err) {
+                                    this.logger.error(`${this.constructor.name} Error on unsubscribe from redis channel '${name}'.`);
+                                    reject(err);
+                                } else {
+                                    this.logger.debug(`${this.constructor.name} Unsubscribe from redis channel '${name}'.`);
+                                    resolve();
+                                }
+                            });
                         });
-                    });
+                    }
                 }
             })
         )
     }
 
+    _getStreamName(stream) {
+        return Array.isArray(stream) ? stream[0] : stream;
+    }
+
     _getStreamNames(streams) {
         return (streams || []).map(item => Array.isArray(item) ? item[0] : item);
+    }
+
+    _getMaskedStreamNames(availableStreams) {
+        let masked = [];
+        availableStreams.forEach(availableStream => {
+            if (typeof availableStream === 'string' && availableStream.endsWith('_*')) {
+                masked.push(availableStream.substr(0, availableStream.length - 2));
+            }
+        })
+
+        return masked;
     }
 
     /**
