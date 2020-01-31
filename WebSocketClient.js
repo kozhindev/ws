@@ -11,6 +11,8 @@ const WebSocketClient = function (params) {
     this._connection = null;
     this._tryCount = null;
 
+    this._queueToSubscribe = [];
+
     this._authToken = null;
     this._connect = this._connect.bind(this);
     this._onOpen = this._onOpen.bind(this);
@@ -42,9 +44,6 @@ WebSocketClient.prototype = {
     },
 
     subscribe: function (streams) {
-        if (!this._connection) {
-            return;
-        }
         streams = [].concat(streams);
 
         // Стримы для подписки
@@ -74,13 +73,23 @@ WebSocketClient.prototype = {
             });
         })
 
-        // Если есть стримы, на которые нужно подписаться, шлем серверу
+        // Если есть стримы, на которые нужно подписаться
         if (forSubscribe.length > 0) {
-            this._connection.send(JSON.stringify({
-                action: 'subscribe',
-                data: forSubscribe,
-            }));
+            // Если нет соединения или в процессе подключения, добавляем в очередь
+            if (!this._connection || !this._connection.readyState) {
+                this._queueToSubscribe = this._queueToSubscribe.concat(forSubscribe);
+                return;
+            }
+            // Шлем запрос на подписку
+            this.sendSubscribeRequest(forSubscribe);
         }
+    },
+
+    sendSubscribeRequest: function (streams) {
+        this._connection.send(JSON.stringify({
+            action: 'subscribe',
+            data: streams,
+        }));
     },
 
     unsubscribeStream: function (stream, id) {
@@ -170,6 +179,11 @@ WebSocketClient.prototype = {
 
     _onOpen: function () {
         this._tryCount = 0;
+
+        // Если был запрос на подписку, подписываемся
+        if (this._queueToSubscribe.length > 0) {
+            this.sendSubscribeRequest(this._queueToSubscribe)
+        }
 
         if (this.onOpen) {
             this.onOpen();
