@@ -1,6 +1,6 @@
 {
   "name": "kozhindev-ws",
-  "version": "1.0.4",
+  "version": "1.0.6",
   "dependencies": {
     "redis": "^2.8.0",
     "websocket": "^1.0.28",
