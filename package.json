@@ -2,7 +2,7 @@
   "name": "kozhindev-ws",
   "version": "1.0.7",
   "dependencies": {
-    "redis": "^2.8.0",
+    "redis": "^3.1.1",
     "websocket": "^1.0.28",
     "winston": "^3.2.1"
   }
